@@ -56,7 +56,7 @@ class RoboticVisionLLM(nn.Module):
     def __init__(
         self,
         llm_path: str = "llm",
-        action_dim: int = 6,
+        action_dim: int = 17,
         vision_dim: int = 768,
         llm_dim: int = 2048,
         dropout_rate: float = 0.1,
@@ -87,6 +87,7 @@ class RoboticVisionLLM(nn.Module):
         
         self.contrastive_head = nn.Linear(llm_dim, 128)
         self.num_diffusion_steps = num_diffusion_steps
+        self.action_dimension = action_dim
         
     def forward(
         self, 
@@ -109,8 +110,8 @@ class RoboticVisionLLM(nn.Module):
         
         attended = self.cross_attn(llm_features, vision_embeds)
         
-        actions = torch.randn(batch_size, 6).to(self.device)
-        uncertainty = torch.zeros(batch_size, 6).to(self.device)
+        actions = torch.randn(batch_size, self.action_dimension).to(self.device)
+        uncertainty = torch.zeros(batch_size, self.action_dimension).to(self.device)
         
         steps = num_steps or self.num_diffusion_steps
         

@@ -16,7 +16,7 @@ class AdaptiveNoiseScheduler:
 class ActionDiffusion(nn.Module):
     def __init__(
         self,
-        action_dim: int = 6,
+        action_dim: int = 17,
         hidden_dim: int = 256,
         num_layers: int = 4,
         num_heads: int = 8,
