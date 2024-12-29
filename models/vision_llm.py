@@ -4,6 +4,8 @@ import torch.nn.functional as F
 from transformers import AutoModelForCausalLM, ViTModel
 from typing import Tuple, List, Optional
 from .diffusion import ActionDiffusion
+import copy
+from collections import deque
 
 class CrossAttention(nn.Module):
     def __init__(self, dim: int, heads: int = 8):
@@ -55,18 +57,19 @@ class ProgressiveVisionEncoder(nn.Module):
 class RoboticVisionLLM(nn.Module):
     def __init__(
         self,
-        llm_path: str = "llm",
+        llm_path: str = "meta-llama/Llama-3.2-1B",
         action_dim: int = 17,
         vision_dim: int = 768,
         llm_dim: int = 2048,
         dropout_rate: float = 0.1,
         num_ensembles: int = 3,
-        num_diffusion_steps: int = 20
+        num_diffusion_steps: int = 20,
+        momentum: float = 0.99
     ):
         super().__init__()
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         
-        base_vision = ViTModel.from_pretrained('vit')
+        base_vision = ViTModel.from_pretrained('google/vit-base-patch16-224')
         self.vision_encoder = ProgressiveVisionEncoder(base_vision)
         
         self.cross_attn = CrossAttention(llm_dim)
@@ -85,9 +88,35 @@ class RoboticVisionLLM(nn.Module):
             num_timesteps=num_diffusion_steps
         )
         
-        self.contrastive_head = nn.Linear(llm_dim, 128)
+        self.contrastive_head = nn.Sequential(
+            nn.Linear(llm_dim, 1024),
+            nn.ReLU(),
+            nn.Linear(1024, 512),
+            nn.ReLU(),
+            nn.Linear(512, 128)
+        )
         self.num_diffusion_steps = num_diffusion_steps
         self.action_dimension = action_dim
+        
+        self.momentum_encoder = copy.deepcopy(self.vision_encoder)
+        self.momentum_proj = copy.deepcopy(self.vision_proj)
+        
+        for param in self.momentum_encoder.parameters():
+            param.requires_grad = False
+        for param in self.momentum_proj.parameters():
+            param.requires_grad = False
+            
+        self.momentum = momentum
+        self.feature_bank = deque(maxlen=1000)
+        self.learning_rate = 1e-4
+        self.warmup_steps = 100
+        self.current_step = 0
+        
+        self.online_optimizer = torch.optim.AdamW([
+            {'params': self.vision_encoder.parameters()},
+            {'params': self.vision_proj.parameters()},
+            {'params': self.action_diffusion.parameters()}
+        ], lr=self.learning_rate)
         
     def forward(
         self, 
@@ -124,6 +153,76 @@ class RoboticVisionLLM(nn.Module):
             )
             uncertainty = torch.abs(actions - actions.mean(dim=0))
         
-        contrastive = self.contrastive_head(attended.mean(dim=1))
+        attended = self.cross_attn(llm_features, vision_embeds)
+        attended_pooled = attended.mean(dim=1)  # [B, llm_dim]
+        contrastive = self.contrastive_head(attended_pooled)  # [B, 128]
         
-        return actions, uncertainty, F.normalize(contrastive, dim=-1)
+        return actions, uncertainty, attended_pooled
+
+    def get_adaptive_lr(self):
+        """Implement warmup and decay schedule"""
+        if self.current_step < self.warmup_steps:
+            return self.learning_rate * (self.current_step / self.warmup_steps)
+        return self.learning_rate * 0.1 ** (self.current_step / 1000)
+
+    def _compute_ssl_loss(self, curr_features, prev_features):
+        """
+        Compute self-supervised learning loss between current and previous features
+        Args:
+            curr_features: [B, D] tensor of current frame features
+            prev_features: [B, D] tensor of previous frame features
+        """
+        if len(curr_features.shape) > 2:
+            curr_features = curr_features.mean(dim=1)
+        if len(prev_features.shape) > 2:
+            prev_features = prev_features.mean(dim=1)
+            
+        curr_proj = self.contrastive_head(curr_features)  # [B, 128]
+        with torch.no_grad():
+            prev_proj = self.contrastive_head(prev_features)  # [B, 128]
+            
+        curr_proj = F.normalize(curr_proj, dim=-1)
+        prev_proj = F.normalize(prev_proj, dim=-1)
+        
+        sim_matrix = torch.matmul(curr_proj, prev_proj.T)  # [B, B]
+        
+        temp = 0.1
+        labels = torch.arange(sim_matrix.shape[0], device=sim_matrix.device)
+        contrastive_loss = F.cross_entropy(sim_matrix / temp, labels)
+        
+        temporal_loss = F.mse_loss(curr_features, prev_features.detach())
+        
+        return contrastive_loss + 0.1 * temporal_loss
+    
+    def compute_ssl_loss(self, curr_features: torch.Tensor, prev_features: torch.Tensor) -> torch.Tensor:
+        """
+        Compute SSL loss with gradient handling
+        """
+        if len(curr_features.shape) > 2:
+            curr_features = curr_features.view(curr_features.shape[0], -1)
+        if len(prev_features.shape) > 2:
+            prev_features = prev_features.view(prev_features.shape[0], -1)
+            
+        curr_proj = self.contrastive_head(curr_features)  # [B, 128]
+        
+        with torch.no_grad():
+            prev_proj = self.contrastive_head(prev_features)  # [B, 128] 
+        
+        curr_proj = F.normalize(curr_proj, dim=1)
+        prev_proj = F.normalize(prev_proj, dim=1)
+        
+        sim_matrix = torch.matmul(curr_proj, prev_proj.transpose(0, 1))  # [B, B]
+        
+        temp = 0.1
+        sim_matrix = sim_matrix / temp
+        
+        labels = torch.arange(sim_matrix.shape[0], device=sim_matrix.device)
+        
+        return F.cross_entropy(sim_matrix, labels)
+
+    @torch.no_grad()
+    def _momentum_update(self):
+        """Momentum update with validation"""
+        for online, target in zip(self.vision_encoder.parameters(), 
+                                self.momentum_encoder.parameters()):
+            target.data = self.momentum * target.data + (1 - self.momentum) * online.data
